@@ -610,13 +610,14 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     inst->getStateInformation(st0);
     log("[batch] state BEFORE drop = " + juce::String((int) st0.getSize()));
 
+    bool loaded = false;
 #ifdef _WIN32
     juce::AudioProcessorEditor* ed = inst->hasEditor() ? inst->createEditorIfNeeded() : nullptr;
     if (ed != nullptr)
     {
         ed->setOpaque(true);
         ed->addToDesktop(juce::ComponentPeer::windowIgnoresKeyPresses);
-        ed->setTopLeftPosition(0, 0);   // on-screen so the drop point lands inside Serum
+        ed->setTopLeftPosition(0, 0);   // real on-screen window (needs an interactive desktop session)
         ed->setVisible(true);
         pumpFor(1200);
 
@@ -624,25 +625,24 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
         RECT wr {};
         GetWindowRect(top, &wr);
         POINTL center { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
-        log("[batch] real OLE drag at (" + juce::String(center.x) + "," + juce::String(center.y) + ")");
-        bool ok = dropFileViaDragLoop(center, presetPath);
-        log("[batch] drag effect-accepted=" + juce::String(ok ? 1 : 0));
-        pumpFor(2500);
+
+        // The real-OLE drag is timing sensitive, so verify the state grew (preset
+        // loaded) and retry until it does.
+        const auto baseSize = (int) st0.getSize();
+        for (int attempt = 0; attempt < 5 && !loaded; ++attempt)
+        {
+            dropFileViaDragLoop(center, presetPath);
+            pumpFor(900);
+            juce::MemoryBlock s;
+            inst->getStateInformation(s);
+            loaded = ((int) s.getSize() > baseSize + 500);
+            log("[batch] drop attempt " + juce::String(attempt)
+                + " state=" + juce::String((int) s.getSize()) + (loaded ? "  <-- LOADED" : ""));
+        }
     }
     else { log("[batch] Serum reports no editor"); }
 #endif
-
-    juce::MemoryBlock st1;
-    inst->getStateInformation(st1);
-    log("[batch] state AFTER drop  = " + juce::String((int) st1.getSize())
-        + (st1.getSize() != st0.getSize() ? "  <-- LOADED" : "  (unchanged)"));
-
-    // CRITICAL: persist the live (just-loaded) plugin state into the edit's
-    // ValueTree, else the offline renderer rebuilds Serum from the stored
-    // DEFAULT state and renders the wrong sound.
-    ext->flushPluginStateToValueTree();
-    pumpFor(150);
-    log("[batch] flushed plugin state to edit");
+    if (!loaded) log("[batch] WARNING: preset NOT loaded after retries");
 
     // Render the LIVE instance directly: it holds the just-loaded preset. The
     // offline te::Renderer would re-instantiate Serum and CANNOT restore its
@@ -660,7 +660,8 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     log("[batch] DONE");
 
 #ifdef _WIN32
-    OleUninitialize();
+    std::cout.flush();
+    std::_Exit(ok ? 0 : 5);   // hard-exit: WAV is flushed; avoids editor/teardown hang
 #endif
     return ok ? 0 : 5;
 }
