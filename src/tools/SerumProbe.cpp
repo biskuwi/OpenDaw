@@ -637,23 +637,26 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     log("[batch] state AFTER drop  = " + juce::String((int) st1.getSize())
         + (st1.getSize() != st0.getSize() ? "  <-- LOADED" : "  (unchanged)"));
 
-    // MIDI note: 6 beats = 3s @120bpm; note on@0, off@1s (2 beats).
-    if (auto* clip = em.addMidiClipToTrack(*track, 0.0, 6.0))
-        clip->getSequence().addNote(kMidiNote, tracktion::BeatPosition::fromBeats(0.0),
-            tracktion::BeatDuration::fromBeats(2.0), kVelocity, 0, nullptr);
-    log("[batch] midi note added");
-    pumpFor(200);
+    // CRITICAL: persist the live (just-loaded) plugin state into the edit's
+    // ValueTree, else the offline renderer rebuilds Serum from the stored
+    // DEFAULT state and renders the wrong sound.
+    ext->flushPluginStateToValueTree();
+    pumpFor(150);
+    log("[batch] flushed plugin state to edit");
 
-    OpenDaw::ExportSettings es;
-    es.destFile = outFolder.getChildFile("rendered_batch.wav");
-    es.sampleRate = kSampleRate;
-    es.bitDepth = 24;
-    es.normalize = false;
-    es.format = OpenDaw::ExportFormat::WAV;
-    bool ok = em.exportMix(es, [](float) {});
-    log(juce::String("[batch] exportMix ok=") + (ok ? "1" : "0")
-        + " exists=" + juce::String(es.destFile.existsAsFile() ? 1 : 0)
-        + " size=" + juce::String((int) es.destFile.getSize()));
+    // Render the LIVE instance directly: it holds the just-loaded preset. The
+    // offline te::Renderer would re-instantiate Serum and CANNOT restore its
+    // (editor-dependent) encrypted state, so it renders the default sound.
+    // Suspend Tracktion's audio thread first so it isn't also calling processBlock.
+    em.suspendEngine();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(150);
+    auto audio = renderNote(*inst);
+    juce::File wav = outFolder.getChildFile("rendered_batch.wav");
+    writeWav(wav, audio);
+    em.resumeEngine();
+    const bool ok = wav.existsAsFile();
+    log("[batch] DIRECT render rms=" + juce::String(rms(audio))
+        + " exists=" + juce::String(ok ? 1 : 0));
     log("[batch] DONE");
 
 #ifdef _WIN32
