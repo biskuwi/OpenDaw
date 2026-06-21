@@ -91,7 +91,7 @@ juce::String markerSummary(const juce::MemoryBlock& mb)
 }
 
 // Render `inst` to a stereo buffer: noteOn at t=0, noteOff at kGate, capture kDuration.
-juce::AudioBuffer<float> renderNote(juce::AudioPluginInstance& inst)
+juce::AudioBuffer<float> renderNote(juce::AudioPluginInstance& inst, int midiNote = kMidiNote)
 {
     inst.prepareToPlay(kSampleRate, kBlockSize);
     const int total = (int) (kSampleRate * kDuration);
@@ -109,9 +109,9 @@ juce::AudioBuffer<float> renderNote(juce::AudioPluginInstance& inst)
 
         juce::MidiBuffer midi;
         if (pos == 0)
-            midi.addEvent(juce::MidiMessage::noteOn(1, kMidiNote, (juce::uint8) kVelocity), 0);
+            midi.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8) kVelocity), 0);
         if (offAt >= pos && offAt < pos + n)
-            midi.addEvent(juce::MidiMessage::noteOff(1, kMidiNote), offAt - pos);
+            midi.addEvent(juce::MidiMessage::noteOff(1, midiNote), offAt - pos);
 
         inst.processBlock(block, midi);
 
@@ -650,14 +650,23 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     // Suspend Tracktion's audio thread first so it isn't also calling processBlock.
     em.suspendEngine();
     juce::MessageManager::getInstance()->runDispatchLoopUntil(150);
-    auto audio = renderNote(*inst);
-    juce::File wav = outFolder.getChildFile("rendered_batch.wav");
-    writeWav(wav, audio);
+
+    // Multisample: load the preset once, render C1..C5 (MIDI 24/36/48/60/72).
+    struct Note { const char* name; int midi; };
+    const Note notes[] = { {"C1", 24}, {"C2", 36}, {"C3", 48}, {"C4", 60}, {"C5", 72} };
+    int written = 0;
+    for (const auto& nt : notes)
+    {
+        auto audio = renderNote(*inst, nt.midi);
+        juce::File wav = outFolder.getChildFile(juce::String(nt.name) + ".wav");
+        writeWav(wav, audio);
+        if (wav.existsAsFile()) ++written;
+        log("[batch] render " + juce::String(nt.name) + " rms=" + juce::String(rms(audio)));
+    }
     em.resumeEngine();
-    const bool ok = wav.existsAsFile();
-    log("[batch] DIRECT render rms=" + juce::String(rms(audio))
-        + " exists=" + juce::String(ok ? 1 : 0));
-    log("[batch] DONE");
+    const bool ok = (written == 5) && loaded;
+    log("[batch] DONE written=" + juce::String(written)
+        + " loaded=" + juce::String(loaded ? 1 : 0));
 
 #ifdef _WIN32
     std::cout.flush();
