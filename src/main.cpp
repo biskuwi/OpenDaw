@@ -10,6 +10,9 @@
 #include "ui/MainWindow.h"
 #include "ui/SplashScreen.h"
 #include "utils/IconFont.h"
+#include "tools/SerumProbe.h"
+
+#include <cstring>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -81,6 +84,18 @@ static LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep)
 
 int main(int argc, char* argv[])
 {
+    // Pure-JUCE probe (no Qt): quick experiments only.
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--serum-probe") == 0)
+            return OpenDaw::runSerumProbe(argc, argv);
+
+    // Headless render: boot the FULL app (Qt + JuceQtBridge + Tracktion) with no
+    // window, then drive the drop+render from a timer in the proven event loop.
+    bool batchRender = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--serum-render") == 0)
+            batchRender = true;
+
     QApplication qtApp(argc, argv);
     qtApp.setApplicationName("OpenDaw");
     qtApp.setApplicationVersion(OpenDaw_VERSION);
@@ -104,9 +119,12 @@ int main(int argc, char* argv[])
 
     OpenDaw::icons::registerFonts();
 
-    auto* splash = new OpenDaw::SplashScreen();
-    splash->show();
-    qtApp.processEvents();
+    OpenDaw::SplashScreen* splash = nullptr;
+    if (!batchRender) {
+        splash = new OpenDaw::SplashScreen();
+        splash->show();
+        qtApp.processEvents();
+    }
 
     juce::ScopedJuceInitialiser_GUI juceInit;
 
@@ -115,6 +133,17 @@ int main(int argc, char* argv[])
     qDebug() << "[main] calling initialize";
     if (!app.initialize())
         return 1;
+
+    // Headless render: drive drop+render in the running Qt/JuceQtBridge loop, then quit.
+    if (batchRender) {
+        qDebug() << "[main] headless batch render mode";
+        QTimer::singleShot(800, [&]() {
+            int rc = OpenDaw::runSerumBatchRender(app, argc, argv);
+            qtApp.exit(rc);
+        });
+        return qtApp.exec();
+    }
+
     qDebug() << "[main] initialize done, checking recovery";
 
     app.checkRecovery(splash);

@@ -407,6 +407,38 @@ void MainWindow::createMenus()
     editMenu->addAction("Scan &VST Plugins...", this,
         &MainWindow::onScanVstPlugins);
 
+    // ---- Serum state-capture helpers (scan-free, for the one-time format spike) ----
+    editMenu->addSeparator();
+    editMenu->addAction("Capture: Quick-load Serum 2", this, [this]() {
+        juce::VST3PluginFormat vst3;
+        juce::OwnedArray<juce::PluginDescription> descs;
+        vst3.findAllTypesForFile(descs,
+            juce::String(R"(C:\Program Files\Common Files\VST3\Serum2.vst3)"));
+        juce::PluginDescription* chosen = nullptr;
+        for (auto* d : descs) if (d->isInstrument) { chosen = d; break; }
+        if (chosen == nullptr) { statusBar()->showMessage("Serum 2 not found"); return; }
+        app_.pluginScanner().getPluginList().addType(*chosen);
+        auto* track = editMgr_.getAudioTrack(0);
+        if (track == nullptr) { statusBar()->showMessage("No audio track on which to load Serum"); return; }
+        editMgr_.setTrackInstrument(*track, *chosen);
+        statusBar()->showMessage("Serum 2 loaded on Track 1 - click its instrument slot to open, "
+                                 "load a preset, then Edit > Capture: Dump Serum State");
+    });
+    editMenu->addAction("Capture: Dump Serum State", this, [this]() {
+        auto* track = editMgr_.getAudioTrack(0);
+        auto* plugin = track ? editMgr_.getTrackInstrument(track) : nullptr;
+        auto* ext = dynamic_cast<te::ExternalPlugin*>(plugin);
+        auto* inst = ext ? ext->getAudioPluginInstance() : nullptr;
+        if (inst == nullptr) { statusBar()->showMessage("No instrument instance on Track 1"); return; }
+        juce::MemoryBlock mb;
+        inst->getStateInformation(mb);
+        juce::File out(R"(C:\Users\yalci\mt-dev\OpenDaw\crux\serum_state_dump.bin)");
+        out.getParentDirectory().createDirectory();
+        out.replaceWithData(mb.getData(), mb.getSize());
+        statusBar()->showMessage(
+            QString("Dumped %1 bytes -> crux\\serum_state_dump.bin").arg((int) mb.getSize()));
+    });
+
     splitClipAction_ = new QAction(style()->standardIcon(QStyle::SP_ArrowRight),
                                    "Split Clip", this);
     splitClipAction_->setShortcut(QKeySequence(Qt::Key_S));

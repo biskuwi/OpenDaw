@@ -69,6 +69,7 @@ add_subdirectory(libs/tracktion_engine)
 # ── Source files ─────────────────────────────────────────────────────────────
 set(OpenDaw_SOURCES
     src/main.cpp
+    src/tools/SerumProbe.h          src/tools/SerumProbe.cpp
     src/app/OpenDawApplication.h    src/app/OpenDawApplication.cpp
     src/app/JuceQtBridge.h          src/app/JuceQtBridge.cpp
     src/engine/AudioEngine.h        src/engine/AudioEngine.cpp
