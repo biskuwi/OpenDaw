@@ -8,4 +8,6 @@ CMakeSettings.json
 *.swp
 *.swo
 *~
-.cursor/crux/
+.cursor/
+crux/
+2/
