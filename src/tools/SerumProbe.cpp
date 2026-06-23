@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstring>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 namespace te = tracktion::engine;
@@ -511,10 +512,15 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override  { return (ULONG) InterlockedIncrement(&ref_); }
     ULONG STDMETHODCALLTYPE Release() override
     { LONG c = InterlockedDecrement(&ref_); if (c == 0) delete this; return (ULONG) c; }
-    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL esc, DWORD) override
+    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL esc, DWORD keyState) override
     {
+        log("[drop] QCD call=" + juce::String(calls_) + " esc=" + juce::String((int) esc)
+            + " keys=0x" + juce::String::toHexString((int) keyState));
         if (esc) return DRAGDROP_S_CANCEL;
-        if (++calls_ >= 2) return DRAGDROP_S_DROP;   // force the drop after settling
+        // Complete the drop once the held button is released (natural drop) or after
+        // a few settle iterations, whichever comes first.
+        if (!(keyState & MK_LBUTTON)) return DRAGDROP_S_DROP;
+        if (++calls_ >= 4) return DRAGDROP_S_DROP;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
@@ -527,16 +533,60 @@ private:
 // delivers a genuine drag to whatever window is under the cursor (= Serum).
 bool dropFileViaDragLoop(POINTL center, const juce::String& path)
 {
+    log("[drop] begin");
     IDataObject* pdo = makeFileDataObject(path);
-    if (pdo == nullptr) return false;
+    if (pdo == nullptr) { log("[drop] makeFileDataObject FAILED"); return false; }
     auto* src = new DragSource();
+
+    // Force Serum's window to the FOREGROUND + active input window. DoDragDrop only
+    // captures/pumps input for the foreground thread's window, so unattended (when
+    // OpenDaw is launched in the background and never gets focus) the drag loop
+    // never sees input and hangs. SetForegroundWindow alone is denied by Windows'
+    // foreground lock, so attach to the current foreground thread's input queue
+    // first (the canonical bypass), then promote our window.
+    if (HWND under = WindowFromPoint(POINT{ center.x, center.y }))
+    {
+        HWND root = GetAncestor(under, GA_ROOT);
+        DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+        DWORD myThread = GetCurrentThreadId();
+        AttachThreadInput(myThread, fgThread, TRUE);
+        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID) 0, SPIF_SENDCHANGE);
+        BringWindowToTop(root);
+        SetForegroundWindow(root);
+        SetActiveWindow(root);
+        SetFocus(root);
+        AttachThreadInput(myThread, fgThread, FALSE);
+        log("[drop] foreground forced, fg=" + juce::String((int) (GetForegroundWindow() == root)));
+    }
 
     SetCursorPos(center.x, center.y);
     INPUT dn {}; dn.type = INPUT_MOUSE; dn.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
     SendInput(1, &dn, sizeof(INPUT));
 
+    // DoDragDrop runs a modal loop that only calls IDropSource::QueryContinueDrag
+    // when it observes a change in mouse/button state. With no ambient cursor
+    // movement (unattended batch) the loop blocks forever, so a watchdog thread
+    // drives it: jiggle the cursor over Serum (SetCursorPos => WM_MOUSEMOVE), then
+    // RELEASE the held button (LBUTTONUP) — a real drop gesture that forces the
+    // loop to call QueryContinueDrag with the button up and complete the drop.
+    std::atomic<bool> dragDone{ false };
+    std::thread nudger([&dragDone, center]
+    {
+        for (int i = 0; i < 16 && !dragDone.load(); ++i)
+        {
+            SetCursorPos(center.x + (i % 2 ? 4 : -4), center.y + (i % 3 ? 3 : -3));
+            Sleep(20);
+        }
+        // Drop: release the button over Serum.
+        INPUT up {}; up.type = INPUT_MOUSE; up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(1, &up, sizeof(INPUT));
+    });
+
+    log("[drop] calling DoDragDrop");
     DWORD effect = 0;
     HRESULT hr = DoDragDrop(pdo, src, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, &effect);
+    dragDone.store(true);
+    nudger.join();
 
     INPUT up {}; up.type = INPUT_MOUSE; up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
     SendInput(1, &up, sizeof(INPUT));
@@ -614,33 +664,63 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
 
     bool loaded = false;
 #ifdef _WIN32
+    log("[batch] hasEditor=" + juce::String(inst->hasEditor() ? 1 : 0) + " -> creating editor");
     juce::AudioProcessorEditor* ed = inst->hasEditor() ? inst->createEditorIfNeeded() : nullptr;
+    log("[batch] createEditorIfNeeded returned ed=" + juce::String(ed != nullptr ? 1 : 0));
     if (ed != nullptr)
     {
         ed->setOpaque(true);
         ed->addToDesktop(juce::ComponentPeer::windowIgnoresKeyPresses);
         ed->setTopLeftPosition(0, 0);   // real on-screen window (needs an interactive desktop session)
         ed->setVisible(true);
+        log("[batch] editor on desktop, pumping");
         pumpFor(1200);
 
         HWND top = reinterpret_cast<HWND>(ed->getWindowHandle());
         RECT wr {};
         GetWindowRect(top, &wr);
         POINTL center { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
+        log("[batch] window rect L=" + juce::String((int) wr.left) + " T=" + juce::String((int) wr.top)
+            + " R=" + juce::String((int) wr.right) + " B=" + juce::String((int) wr.bottom)
+            + " center=(" + juce::String((int) center.x) + "," + juce::String((int) center.y) + ")");
 
-        // The real-OLE drag is timing sensitive, so verify the state grew (preset
-        // loaded) and retry until it does.
+        // Load the preset by calling Serum's registered OLE drop target DIRECTLY
+        // (DragEnter/DragOver/Drop on the main/STA thread). This needs no cursor,
+        // foreground, or input injection, so it works fully unattended — unlike
+        // DoDragDrop, whose modal loop hangs when launched in the background with
+        // no ambient mouse movement. Verify the state grew (preset loaded); retry.
         const auto baseSize = (int) st0.getSize();
-        for (int attempt = 0; attempt < 5 && !loaded; ++attempt)
+        IDataObject* keepAlive = nullptr;
+        for (int attempt = 0; attempt < 4 && !loaded; ++attempt)
         {
-            dropFileViaDragLoop(center, presetPath);
-            pumpFor(900);
+            bool dropOk = false;
+            IDataObject* pdo = dropFileBestTarget(top, presetPath, dropOk);
+            pumpFor(1300);                 // Serum may read the file on a later tick
             juce::MemoryBlock s;
             inst->getStateInformation(s);
             loaded = ((int) s.getSize() > baseSize + 500);
-            log("[batch] drop attempt " + juce::String(attempt)
+            log("[batch] direct-drop attempt " + juce::String(attempt) + " ok=" + juce::String(dropOk ? 1 : 0)
                 + " state=" + juce::String((int) s.getSize()) + (loaded ? "  <-- LOADED" : ""));
+            if (keepAlive) keepAlive->Release();
+            keepAlive = pdo;               // hold the latest data object alive across the pump
         }
+        // Fallback: if the direct target rejected the drop, try the real OLE drag
+        // (works only with an interactive foreground window + mouse, but harmless).
+        if (!loaded)
+        {
+            log("[batch] direct drop did not load; falling back to OLE drag");
+            for (int attempt = 0; attempt < 2 && !loaded; ++attempt)
+            {
+                dropFileViaDragLoop(center, presetPath);
+                pumpFor(900);
+                juce::MemoryBlock s;
+                inst->getStateInformation(s);
+                loaded = ((int) s.getSize() > baseSize + 500);
+                log("[batch] drag attempt " + juce::String(attempt)
+                    + " state=" + juce::String((int) s.getSize()) + (loaded ? "  <-- LOADED" : ""));
+            }
+        }
+        if (keepAlive) { pumpFor(300); keepAlive->Release(); }
     }
     else { log("[batch] Serum reports no editor"); }
 #endif
