@@ -459,21 +459,38 @@ IDataObject* dropFileBestTarget(HWND top, const juce::String& path, bool& ok)
         ++targets;
         RECT r {};
         GetWindowRect(h, &r);
-        if (r.right <= r.left || r.bottom <= r.top) continue;
-        POINTL pt { (r.left + r.right) / 2, (r.top + r.bottom) / 2 };
-        DWORD eff = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
-        HRESULT he = dt->DragEnter(pdo, MK_LEFTBUTTON, pt, &eff);
-        log("[drop] target#" + juce::String(targets) + " enter eff=" + juce::String((int) eff)
-            + " rect=" + juce::String((int)(r.right - r.left)) + "x" + juce::String((int)(r.bottom - r.top)));
-        if (SUCCEEDED(he) && eff != 0)
+        const int w = r.right - r.left, ht = r.bottom - r.top;
+        if (w <= 0 || ht <= 0) continue;
+        // Serum's DragEnter hit-tests the drop point: it accepts a preset over the
+        // synth/oscillator area but REJECTS over some controls, and which region
+        // the window centre lands on varies run-to-run. So try several points and
+        // use the first that accepts (eff != 0) instead of the centre alone.
+        const POINTL pts[] = {
+            { r.left + w / 2, r.top + ht / 2 },        // centre
+            { r.left + w / 2, r.top + ht / 4 },        // upper middle
+            { r.left + w / 2, r.top + 3 * ht / 4 },    // lower middle
+            { r.left + w / 4, r.top + ht / 2 },        // left middle
+            { r.left + 3 * w / 4, r.top + ht / 2 },    // right middle
+            { r.left + w / 2, r.top + ht / 8 },        // top (browser/header)
+        };
+        for (const POINTL& pt : pts)
         {
-            DWORD e2 = DROPEFFECT_COPY; dt->DragOver(MK_LEFTBUTTON, pt, &e2);
-            DWORD e3 = DROPEFFECT_COPY; HRESULT hd = dt->Drop(pdo, MK_LEFTBUTTON, pt, &e3);
-            log("[drop] ACCEPTED target#" + juce::String(targets) + " drop eff=" + juce::String((int) e3));
-            ok = SUCCEEDED(hd);
-            return pdo;
+            DWORD eff = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+            HRESULT he = dt->DragEnter(pdo, MK_LEFTBUTTON, pt, &eff);
+            if (SUCCEEDED(he) && eff != 0)
+            {
+                DWORD e2 = DROPEFFECT_COPY; dt->DragOver(MK_LEFTBUTTON, pt, &e2);
+                DWORD e3 = DROPEFFECT_COPY; HRESULT hd = dt->Drop(pdo, MK_LEFTBUTTON, pt, &e3);
+                log("[drop] ACCEPTED target#" + juce::String(targets) + " at ("
+                    + juce::String((int) pt.x) + "," + juce::String((int) pt.y)
+                    + ") drop eff=" + juce::String((int) e3));
+                ok = SUCCEEDED(hd);
+                return pdo;
+            }
+            dt->DragLeave();
         }
-        dt->DragLeave();
+        log("[drop] target#" + juce::String(targets) + " rejected all points rect="
+            + juce::String(w) + "x" + juce::String(ht));
     }
     log("[drop] NO OLE target accepted (targets=" + juce::String(targets) + "); trying WM_DROPFILES");
 
@@ -674,7 +691,7 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
         ed->setTopLeftPosition(0, 0);   // real on-screen window (needs an interactive desktop session)
         ed->setVisible(true);
         log("[batch] editor on desktop, pumping");
-        pumpFor(1200);
+        pumpFor(2500);   // let Serum's UI fully realize so its drop target is ready
 
         HWND top = reinterpret_cast<HWND>(ed->getWindowHandle());
         RECT wr {};
@@ -691,8 +708,9 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
         // no ambient mouse movement. Verify the state grew (preset loaded); retry.
         const auto baseSize = (int) st0.getSize();
         IDataObject* keepAlive = nullptr;
-        for (int attempt = 0; attempt < 4 && !loaded; ++attempt)
+        for (int attempt = 0; attempt < 5 && !loaded; ++attempt)
         {
+            if (attempt > 0) pumpFor(700 * attempt);   // give Serum more UI-ready time each retry
             bool dropOk = false;
             IDataObject* pdo = dropFileBestTarget(top, presetPath, dropOk);
             pumpFor(1300);                 // Serum may read the file on a later tick
@@ -704,22 +722,10 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
             if (keepAlive) keepAlive->Release();
             keepAlive = pdo;               // hold the latest data object alive across the pump
         }
-        // Fallback: if the direct target rejected the drop, try the real OLE drag
-        // (works only with an interactive foreground window + mouse, but harmless).
-        if (!loaded)
-        {
-            log("[batch] direct drop did not load; falling back to OLE drag");
-            for (int attempt = 0; attempt < 2 && !loaded; ++attempt)
-            {
-                dropFileViaDragLoop(center, presetPath);
-                pumpFor(900);
-                juce::MemoryBlock s;
-                inst->getStateInformation(s);
-                loaded = ((int) s.getSize() > baseSize + 500);
-                log("[batch] drag attempt " + juce::String(attempt)
-                    + " state=" + juce::String((int) s.getSize()) + (loaded ? "  <-- LOADED" : ""));
-            }
-        }
+        // No DoDragDrop fallback: it hangs forever when launched unattended (no
+        // ambient mouse), so it only ever wastes the timeout. If the direct drop
+        // failed all attempts we exit non-zero below and the caller relaunches a
+        // fresh process (which reliably loads) rather than burning 60s here.
         if (keepAlive) { pumpFor(300); keepAlive->Release(); }
     }
     else { log("[batch] Serum reports no editor"); }
