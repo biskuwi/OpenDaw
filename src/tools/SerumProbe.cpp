@@ -688,9 +688,9 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     {
         ed->setOpaque(true);
         ed->addToDesktop(juce::ComponentPeer::windowIgnoresKeyPresses);
-        ed->setTopLeftPosition(0, 0);   // real on-screen window (needs an interactive desktop session)
-        ed->setVisible(true);
-        log("[batch] editor on desktop, pumping");
+        ed->setTopLeftPosition(0, 0);   // on-screen, foreground (Serum's drop target
+        ed->setVisible(true);            // only becomes ready when the window is the
+        log("[batch] editor on desktop, pumping");   // active, un-occluded foreground
         pumpFor(2500);   // let Serum's UI fully realize so its drop target is ready
 
         HWND top = reinterpret_cast<HWND>(ed->getWindowHandle());
