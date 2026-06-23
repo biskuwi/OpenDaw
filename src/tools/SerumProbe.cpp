@@ -567,11 +567,13 @@ static void pumpFor(int ms)
 int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
 {
     juce::String presetPath, outDir = R"(C:\Users\yalci\mt-dev\OpenDaw\crux)";
+    int octaveOffset = 0;   // preset's sounding-vs-MIDI octave offset (pre-compensation)
     for (int i = 1; i < argc; ++i)
         if (std::strcmp(argv[i], "--serum-render") == 0)
         {
             if (i + 1 < argc) presetPath = juce::String::fromUTF8(argv[i + 1]);
             if (i + 2 < argc) outDir     = juce::String::fromUTF8(argv[i + 2]);
+            if (i + 3 < argc) octaveOffset = std::atoi(argv[i + 3]);
             break;
         }
 
@@ -579,7 +581,7 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     outFolder.createDirectory();
     g_logFile = outFolder.getChildFile("batch_console.log");
     g_logFile.replaceWithText("");
-    log("[batch] preset = " + presetPath);
+    log("[batch] preset = " + presetPath + "  octaveOffset = " + juce::String(octaveOffset));
 
 #ifdef _WIN32
     OleInitialize(nullptr);
@@ -651,21 +653,33 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
     em.suspendEngine();
     juce::MessageManager::getInstance()->runDispatchLoopUntil(150);
 
-    // Multisample: load the preset once, render C1..C5 (MIDI 24/36/48/60/72).
-    struct Note { const char* name; int midi; };
+    // Multisample: load the preset once, render so each sample SOUNDS at the
+    // target octave C1..C5. The preset transposes by octaveOffset (sounding =
+    // midi + offset), so play midi = targetBase - 12*offset. Skip if the
+    // pre-compensated MIDI falls outside 0..127 (octave unreachable by keytrack).
+    struct Note { const char* name; int base; };
     const Note notes[] = { {"C1", 24}, {"C2", 36}, {"C3", 48}, {"C4", 60}, {"C5", 72} };
-    int written = 0;
+    int written = 0, target = 0;
     for (const auto& nt : notes)
     {
-        auto audio = renderNote(*inst, nt.midi);
+        const int midi = nt.base - 12 * octaveOffset;
+        if (midi < 0 || midi > 127)
+        {
+            log("[batch] skip " + juce::String(nt.name) + " (MIDI " + juce::String(midi)
+                + " out of range, octave unreachable)");
+            continue;
+        }
+        ++target;
+        auto audio = renderNote(*inst, midi);
         juce::File wav = outFolder.getChildFile(juce::String(nt.name) + ".wav");
         writeWav(wav, audio);
         if (wav.existsAsFile()) ++written;
-        log("[batch] render " + juce::String(nt.name) + " rms=" + juce::String(rms(audio)));
+        log("[batch] render " + juce::String(nt.name) + " (midi=" + juce::String(midi)
+            + ") rms=" + juce::String(rms(audio)));
     }
     em.resumeEngine();
-    const bool ok = (written == 5) && loaded;
-    log("[batch] DONE written=" + juce::String(written)
+    const bool ok = (written == target) && target > 0 && loaded;
+    log("[batch] DONE written=" + juce::String(written) + "/" + juce::String(target)
         + " loaded=" + juce::String(loaded ? 1 : 0));
 
 #ifdef _WIN32
