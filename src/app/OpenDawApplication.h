@@ -19,7 +19,7 @@ public:
     explicit OpenDawApplication(QObject* parent = nullptr);
     ~OpenDawApplication() override;
 
-    bool initialize();
+    bool initialize(bool headless = false);   // headless: skip audio-device init (offline render)
     void checkRecovery(QWidget* splashToHide = nullptr);
     void showMainWindow();
 

@@ -7,6 +7,8 @@ class OpenDawApplication;
 // Headless render inside the full app's Qt + JuceQtBridge + Tracktion loop:
 // loads Serum on track 0, drops the .SerumPreset, adds a note, renders to WAV.
 //   OpenDaw.exe --serum-render "<preset.SerumPreset>" "<out_dir>"
+//   OpenDaw.exe --serum-bake "<preset.SerumPreset>" "<state.serumstate>"
+//   OpenDaw.exe --serum-render-state "<state.serumstate>" "<midi>" "<out_dir>" <bpm> [loopBars]
 int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv);
 
 // Headless Serum experiment / render backend entry point.

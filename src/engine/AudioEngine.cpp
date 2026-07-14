@@ -26,6 +26,20 @@ void AudioEngine::setDefaultAudioDevice()
     juce::MessageManager::getInstance()->runDispatchLoopUntil(200);
 }
 
+void AudioEngine::setHeadlessAudioDevice()
+{
+    // Offline render (--serum-render*): open ONLY the system-default output (no
+    // inputs, no saved device settings). This matches the proven standalone render
+    // path and gives Tracktion a valid sample rate to instantiate/prepare plugins,
+    // WITHOUT loading the user's saved interface (often single-client ASIO/exclusive)
+    // — so it won't block other DAWs (e.g. Ableton) and multiple headless instances
+    // can coexist. The render itself re-prepares Serum at 44.1k and drives
+    // processBlock directly, so the device is never actually played through.
+    auto& dm = engine_->getDeviceManager();
+    dm.initialise(0, 2);
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(200);
+}
+
 void AudioEngine::restoreSavedAudioSettings()
 {
     QSettings settings;

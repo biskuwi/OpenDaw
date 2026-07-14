@@ -13,7 +13,7 @@ OpenDawApplication::OpenDawApplication(QObject* parent)
 
 OpenDawApplication::~OpenDawApplication() = default;
 
-bool OpenDawApplication::initialize()
+bool OpenDawApplication::initialize(bool headless)
 {
     qDebug() << "[init] creating JuceQtBridge";
     bridge_ = std::make_unique<JuceQtBridge>(this);
@@ -21,8 +21,17 @@ bool OpenDawApplication::initialize()
 
     qDebug() << "[init] creating AudioEngine";
     audioEngine_ = std::make_unique<AudioEngine>();
-    audioEngine_->setDefaultAudioDevice();
-    audioEngine_->restoreSavedAudioSettings();
+    // Headless offline render (--serum-render*) renders via direct processBlock and
+    // never plays through hardware. It still needs a valid audio context (sample
+    // rate) to instantiate plugins, so open ONLY the system-default output — NOT the
+    // user's saved interface (restoreSavedAudioSettings), which is often single-client
+    // ASIO/exclusive and would deadlock under concurrency AND block other DAWs.
+    if (headless) {
+        audioEngine_->setHeadlessAudioDevice();
+    } else {
+        audioEngine_->setDefaultAudioDevice();
+        audioEngine_->restoreSavedAudioSettings();
+    }
 
     qDebug() << "[init] creating EditManager";
     editManager_ = std::make_unique<EditManager>(*audioEngine_);

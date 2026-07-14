@@ -16,6 +16,7 @@
 #include "app/OpenDawApplication.h"
 #include "engine/EditManager.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <iostream>
@@ -146,6 +147,179 @@ void writeWav(const juce::File& f, const juce::AudioBuffer<float>& buf)
 }
 
 void log(const juce::String& s) { flog(s); qDebug().noquote() << s.toRawUTF8(); }
+
+// ---- MIDI-clip printing ----------------------------------------------------
+// Parse a .mid to a time-sorted event list in SECONDS at the given tempo, then
+// render the whole clip through the LIVE Serum instance (+ release tail). The MT
+// clips carry no reliable tempo meta, so we force `bpm` from the pack manifest.
+struct TimedMidi { double timeSec; juce::MidiMessage msg; };
+
+std::vector<TimedMidi> loadMidiClip(const juce::File& midiFile, double bpm, double& clipEndSec)
+{
+    std::vector<TimedMidi> events;
+    clipEndSec = 0.0;
+    juce::FileInputStream in(midiFile);
+    log("[midi] open ok=" + juce::String(in.openedOk() ? 1 : 0) + " " + midiFile.getFullPathName());
+    if (!in.openedOk()) { log("[midi] cannot open " + midiFile.getFullPathName()); return events; }
+    juce::MidiFile mf;
+    const bool rd = mf.readFrom(in);
+    log("[midi] readFrom=" + juce::String(rd ? 1 : 0)
+        + " tracks=" + juce::String(mf.getNumTracks())
+        + " timeFormat=" + juce::String(mf.getTimeFormat()));
+    if (!rd) { log("[midi] readFrom failed"); return events; }
+
+    const short tf = mf.getTimeFormat();
+    const double tpq = tf > 0 ? (double) tf : 96.0;      // ticks per quarter note
+    const double secPerTick = 60.0 / (bpm * tpq);
+
+    for (int t = 0; t < mf.getNumTracks(); ++t)
+    {
+        const auto* seq = mf.getTrack(t);
+        for (int e = 0; e < seq->getNumEvents(); ++e)
+        {
+            const auto& m = seq->getEventPointer(e)->message;
+            const bool keep = m.isNoteOnOrOff() || m.isController()
+                            || m.isPitchWheel()  || m.isAftertouch()
+                            || m.isChannelPressure();
+            if (!keep) continue;
+            const double ts = m.getTimeStamp() * secPerTick;
+            juce::MidiMessage mm = m;
+            mm.setTimeStamp(ts);
+            events.push_back({ ts, mm });
+            if (m.isNoteOnOrOff()) clipEndSec = juce::jmax(clipEndSec, ts);
+        }
+    }
+    std::sort(events.begin(), events.end(),
+              [](const TimedMidi& a, const TimedMidi& b) { return a.timeSec < b.timeSec; });
+    return events;
+}
+
+juce::AudioBuffer<float> renderMidiClip(juce::AudioPluginInstance& inst,
+                                        const std::vector<TimedMidi>& events,
+                                        double clipEndSec, double tailSec)
+{
+    inst.prepareToPlay(kSampleRate, kBlockSize);
+    const int total = (int) (kSampleRate * (clipEndSec + tailSec));
+    juce::AudioBuffer<float> out(2, total);
+    out.clear();
+
+    juce::AudioBuffer<float> block(2, kBlockSize);
+    size_t idx = 0;
+    int pos = 0;
+    while (pos < total)
+    {
+        const int n = juce::jmin(kBlockSize, total - pos);
+        block.setSize(2, n, false, false, true);
+        block.clear();
+
+        juce::MidiBuffer midi;
+        while (idx < events.size())
+        {
+            const int samp = (int) (events[idx].timeSec * kSampleRate);
+            if (samp >= pos + n) break;
+            midi.addEvent(events[idx].msg, juce::jmax(0, samp - pos));
+            ++idx;
+        }
+
+        inst.processBlock(block, midi);
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            const int src = juce::jmin(ch, block.getNumChannels() - 1);
+            out.copyFrom(ch, pos, block, src, 0, n);
+        }
+        pos += n;
+    }
+    return out;
+}
+
+// Render `events` continuously into a fresh 2ch buffer of exactly `nSamples`,
+// feeding note/CC events at their sample positions. Shared engine for clip/loop.
+static void renderEventsInto(juce::AudioPluginInstance& inst,
+                             const std::vector<TimedMidi>& events,
+                             juce::AudioBuffer<float>& out)
+{
+    const int total = out.getNumSamples();
+    juce::AudioBuffer<float> block(2, kBlockSize);
+    size_t idx = 0;
+    int pos = 0;
+    while (pos < total)
+    {
+        const int n = juce::jmin(kBlockSize, total - pos);
+        block.setSize(2, n, false, false, true);
+        block.clear();
+
+        juce::MidiBuffer midi;
+        while (idx < events.size())
+        {
+            const int samp = (int) (events[idx].timeSec * kSampleRate);
+            if (samp >= pos + n) break;
+            midi.addEvent(events[idx].msg, juce::jmax(0, samp - pos));
+            ++idx;
+        }
+
+        inst.processBlock(block, midi);
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            const int src = juce::jmin(ch, block.getNumChannels() - 1);
+            out.copyFrom(ch, pos, block, src, 0, n);
+        }
+        pos += n;
+    }
+}
+
+// Seamless loop render. Play the pattern TWICE back-to-back and render
+// 2*loopLen + a wrap tail. Keep the 2nd period [L,2L] (by then reverb has built
+// up AND the 1st period's tail bleeds into its start), then overlap-add the
+// spillover ringing past 2L back onto the loop's start so the loop's own end
+// tail continues seamlessly into its beginning. Output is EXACTLY loopLen long
+// with NO trailing tail — a clean bar-locked loop.
+juce::AudioBuffer<float> renderMidiLoop(juce::AudioPluginInstance& inst,
+                                        const std::vector<TimedMidi>& events,
+                                        double loopLenSec)
+{
+    constexpr double kWrapSec = 4.0;   // tail captured past the loop end for wrap-around
+    inst.prepareToPlay(kSampleRate, kBlockSize);
+
+    // Two passes: original + a copy shifted by exactly one loop length.
+    std::vector<TimedMidi> two;
+    two.reserve(events.size() * 2);
+    for (const auto& e : events) two.push_back(e);
+    for (const auto& e : events)
+    {
+        TimedMidi c = e;
+        c.timeSec = e.timeSec + loopLenSec;
+        c.msg.setTimeStamp(c.timeSec);
+        two.push_back(c);
+    }
+    std::sort(two.begin(), two.end(),
+              [](const TimedMidi& a, const TimedMidi& b) { return a.timeSec < b.timeSec; });
+
+    const int loopSamples = (int) (loopLenSec * kSampleRate + 0.5);
+    const int total = 2 * loopSamples + (int) (kWrapSec * kSampleRate);
+
+    juce::AudioBuffer<float> full(2, total);
+    full.clear();
+    renderEventsInto(inst, two, full);
+
+    // Extract the 2nd period [loopSamples, 2*loopSamples).
+    juce::AudioBuffer<float> loop(2, loopSamples);
+    loop.clear();
+    for (int ch = 0; ch < 2; ++ch)
+        loop.copyFrom(ch, 0, full, ch, loopSamples, loopSamples);
+
+    // Tail-wrap: the spillover ringing past 2*loopSamples is pure decaying tail
+    // (no note starts after 2L), so adding it onto the start injects the loop's
+    // own end tail into its beginning — seamless even for reverb-heavy presets.
+    const int wrapSamples = juce::jmin((int) (kWrapSec * kSampleRate), loopSamples);
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        const float* spill = full.getReadPointer(ch, 2 * loopSamples);
+        float* dst = loop.getWritePointer(ch, 0);
+        for (int i = 0; i < wrapSamples; ++i)
+            dst[i] += spill[i];
+    }
+    return loop;
+}
 
 } // namespace
 
@@ -567,7 +741,6 @@ bool dropFileViaDragLoop(POINTL center, const juce::String& path)
         DWORD fgThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
         DWORD myThread = GetCurrentThreadId();
         AttachThreadInput(myThread, fgThread, TRUE);
-        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, (PVOID) 0, SPIF_SENDCHANGE);
         BringWindowToTop(root);
         SetForegroundWindow(root);
         SetActiveWindow(root);
@@ -629,13 +802,46 @@ static void pumpFor(int ms)
     }
 }
 
+#ifdef _WIN32
+// The one-time bake is explicitly interactive: Serum rejects DragOver unless its
+// editor is the active foreground window on the input desktop. Windows normally
+// prevents a background process from stealing focus, so temporarily join the
+// foreground thread's input queue and activate the Serum peer immediately before
+// the drop. This is never called by --serum-render-state.
+static bool activateBakeWindow(HWND window)
+{
+    const HWND foreground = GetForegroundWindow();
+    const DWORD ours = GetCurrentThreadId();
+    const DWORD theirs = foreground != nullptr
+        ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const bool attached = theirs != 0 && theirs != ours
+        && AttachThreadInput(ours, theirs, TRUE) != FALSE;
+
+    ShowWindow(window, SW_SHOW);
+    BringWindowToTop(window);
+    SetActiveWindow(window);
+    SetFocus(window);
+    SetForegroundWindow(window);
+
+    if (attached) AttachThreadInput(ours, theirs, FALSE);
+    return GetForegroundWindow() == window;
+}
+#endif
+
 // Headless render driven from inside the full app's Qt + JuceQtBridge + Tracktion
 // loop (the environment where Serum loads cleanly). One preset -> one WAV.
 int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
 {
+    enum class BatchMode { DropRender, BakeState, RenderState };
+    BatchMode mode = BatchMode::DropRender;
     juce::String presetPath, outDir = R"(C:\Users\yalci\mt-dev\OpenDaw\crux)";
+    juce::String statePath;
+    juce::String midiPath;   // if set -> render this whole MIDI clip instead of C1..C5
+    double bpm = 122.0;      // musical tempo for the clip (from the pack manifest)
+    int loopBars = 0;        // >0 -> seamless bar-locked LOOP; 0 -> one-shot + tail
     int octaveOffset = 0;   // preset's sounding-vs-MIDI octave offset (pre-compensation)
     for (int i = 1; i < argc; ++i)
+    {
         if (std::strcmp(argv[i], "--serum-render") == 0)
         {
             if (i + 1 < argc) presetPath = juce::String::fromUTF8(argv[i + 1]);
@@ -643,14 +849,57 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
             if (i + 3 < argc) octaveOffset = std::atoi(argv[i + 3]);
             break;
         }
+        // --serum-render-midi <preset> <midi> <outdir> <bpm> [loopBars] : print a
+        // MIDI clip through the preset. Reuses the exact same load path as
+        // --serum-render; only the final render step differs. loopBars>0 renders a
+        // seamless bar-locked loop (no tail); 0/absent renders a one-shot + tail.
+        if (std::strcmp(argv[i], "--serum-render-midi") == 0)
+        {
+            if (i + 1 < argc) presetPath = juce::String::fromUTF8(argv[i + 1]);
+            if (i + 2 < argc) midiPath   = juce::String::fromUTF8(argv[i + 2]);
+            if (i + 3 < argc) outDir     = juce::String::fromUTF8(argv[i + 3]);
+            if (i + 4 < argc) bpm        = std::atof(argv[i + 4]);
+            if (i + 5 < argc) loopBars   = std::atoi(argv[i + 5]);
+            break;
+        }
+        // One foreground operation per preset: load via Serum's editor drop target,
+        // then persist Serum's OWN VST3 state chunk (not the .SerumPreset bytes).
+        if (std::strcmp(argv[i], "--serum-bake") == 0)
+        {
+            mode = BatchMode::BakeState;
+            if (i + 1 < argc) presetPath = juce::String::fromUTF8(argv[i + 1]);
+            if (i + 2 < argc) statePath  = juce::String::fromUTF8(argv[i + 2]);
+            if (statePath.isNotEmpty()) outDir = juce::File(statePath).getParentDirectory().getFullPathName();
+            break;
+        }
+        // Fully unattended path: restore a previously baked VST3 state chunk and
+        // render the live Serum instance. No editor window or OLE drop is needed.
+        if (std::strcmp(argv[i], "--serum-render-state") == 0)
+        {
+            mode = BatchMode::RenderState;
+            if (i + 1 < argc) statePath = juce::String::fromUTF8(argv[i + 1]);
+            if (i + 2 < argc) midiPath  = juce::String::fromUTF8(argv[i + 2]);
+            if (i + 3 < argc) outDir    = juce::String::fromUTF8(argv[i + 3]);
+            if (i + 4 < argc) bpm       = std::atof(argv[i + 4]);
+            if (i + 5 < argc) loopBars  = std::atoi(argv[i + 5]);
+            break;
+        }
+    }
 
     juce::File outFolder(outDir);
     outFolder.createDirectory();
     g_logFile = outFolder.getChildFile("batch_console.log");
     g_logFile.replaceWithText("");
     log("[batch] preset = " + presetPath + "  octaveOffset = " + juce::String(octaveOffset));
+    if (statePath.isNotEmpty())
+        log("[batch] statePath = " + statePath
+            + (mode == BatchMode::RenderState ? " (restore)" : " (bake)"));
+    if (midiPath.isNotEmpty())
+        log("[batch] midiPath = " + midiPath + "  bpm = " + juce::String(bpm)
+            + "  loopBars = " + juce::String(loopBars));
 
 #ifdef _WIN32
+    SetUnhandledExceptionFilter(serumCrashHandler);   // crash -> crux\render_crash.log
     OleInitialize(nullptr);
 #endif
 
@@ -677,93 +926,205 @@ int runSerumBatchRender(OpenDawApplication& app, int argc, char** argv)
 
     juce::MemoryBlock st0;
     inst->getStateInformation(st0);
-    log("[batch] state BEFORE drop = " + juce::String((int) st0.getSize()));
+    log("[batch] state BEFORE load = " + juce::String((int) st0.getSize()));
 
     bool loaded = false;
-#ifdef _WIN32
-    log("[batch] hasEditor=" + juce::String(inst->hasEditor() ? 1 : 0) + " -> creating editor");
-    juce::AudioProcessorEditor* ed = inst->hasEditor() ? inst->createEditorIfNeeded() : nullptr;
-    log("[batch] createEditorIfNeeded returned ed=" + juce::String(ed != nullptr ? 1 : 0));
-    if (ed != nullptr)
+    if (mode == BatchMode::RenderState)
     {
-        ed->setOpaque(true);
-        ed->addToDesktop(juce::ComponentPeer::windowIgnoresKeyPresses);
-        ed->setTopLeftPosition(0, 0);   // on-screen window; Serum's GUI must be
-        ed->setVisible(true);            // realized for its drop target to work
-        log("[batch] editor on desktop, pumping");
-        pumpFor(2500);   // let Serum's UI fully realize so its drop target is ready
+        juce::MemoryBlock saved;
+        const juce::File stateFile(statePath);
+        if (!stateFile.existsAsFile() || !stateFile.loadFileAsData(saved) || saved.isEmpty())
+        {
+            log("[batch] FATAL: cannot read baked state " + statePath);
+        }
+        else
+        {
+            log("[batch] restoring baked state bytes=" + juce::String((int) saved.getSize()));
+            inst->setStateInformation(saved.getData(), (int) saved.getSize());
+            // Some plugins finish state application on the message thread. Serum's
+            // editor object is constructed (but never attached to a desktop) so any
+            // editor-owned state bindings exist, then the real Qt/JUCE loop is pumped.
+            if (inst->hasEditor()) inst->createEditorIfNeeded();
+            int settleMs = 1800;
+            const auto settleEnv = juce::SystemStats::getEnvironmentVariable(
+                "OPENDAW_SERUM_STATE_SETTLE_MS", {});
+            if (settleEnv.isNotEmpty())
+                settleMs = juce::jlimit(100, 30000, settleEnv.getIntValue());
+            log("[batch] state settle ms=" + juce::String(settleMs));
+            pumpFor(settleMs);
+            juce::MemoryBlock restored;
+            inst->getStateInformation(restored);
+            const bool differsFromDefault = restored.getSize() != st0.getSize()
+                || (restored.getSize() > 0
+                    && std::memcmp(restored.getData(), st0.getData(), restored.getSize()) != 0);
+            loaded = true;
+            log("[batch] state AFTER restore = " + juce::String((int) restored.getSize())
+                + " differsFromDefault=" + juce::String(differsFromDefault ? 1 : 0));
+        }
+    }
+#ifdef _WIN32
+    if (mode != BatchMode::RenderState)
+    {
+        log("[batch] hasEditor=" + juce::String(inst->hasEditor() ? 1 : 0) + " -> creating editor");
+        juce::AudioProcessorEditor* ed = inst->hasEditor() ? inst->createEditorIfNeeded() : nullptr;
+        log("[batch] createEditorIfNeeded returned ed=" + juce::String(ed != nullptr ? 1 : 0));
+        if (ed != nullptr)
+        {
+            ed->setOpaque(true);
+            ed->addToDesktop(juce::ComponentPeer::windowIgnoresKeyPresses);
+            ed->setTopLeftPosition(0, 0);   // on-screen window; Serum's GUI must be
+            ed->setVisible(true);            // realized for its drop target to work
+            log("[batch] editor on desktop, pumping");
+            pumpFor(2500);   // let Serum's UI fully realize so its drop target is ready
 
-        HWND top = reinterpret_cast<HWND>(ed->getWindowHandle());
-        RECT wr {};
-        GetWindowRect(top, &wr);
-        POINTL center { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
-        log("[batch] window rect L=" + juce::String((int) wr.left) + " T=" + juce::String((int) wr.top)
-            + " R=" + juce::String((int) wr.right) + " B=" + juce::String((int) wr.bottom)
-            + " center=(" + juce::String((int) center.x) + "," + juce::String((int) center.y) + ")");
+            HWND top = reinterpret_cast<HWND>(ed->getWindowHandle());
+            RECT wr {};
+            GetWindowRect(top, &wr);
+            POINTL center { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
+            log("[batch] window rect L=" + juce::String((int) wr.left) + " T=" + juce::String((int) wr.top)
+                + " R=" + juce::String((int) wr.right) + " B=" + juce::String((int) wr.bottom)
+                + " center=(" + juce::String((int) center.x) + "," + juce::String((int) center.y) + ")");
 
         // Load the preset by calling Serum's registered OLE drop target DIRECTLY
         // (DragEnter/DragOver/Drop on the main/STA thread). This needs no cursor,
         // foreground, or input injection, so it works fully unattended — unlike
         // DoDragDrop, whose modal loop hangs when launched in the background with
         // no ambient mouse movement. Verify the state grew (preset loaded); retry.
-        const auto baseSize = (int) st0.getSize();
-        IDataObject* keepAlive = nullptr;
-        for (int attempt = 0; attempt < 5 && !loaded; ++attempt)
-        {
-            if (attempt > 0) pumpFor(700 * attempt);   // give Serum more UI-ready time each retry
-            bool dropOk = false;
-            IDataObject* pdo = dropFileBestTarget(top, presetPath, dropOk);
-            pumpFor(1300);                 // Serum may read the file on a later tick
-            juce::MemoryBlock s;
-            inst->getStateInformation(s);
-            loaded = ((int) s.getSize() > baseSize + 500);
-            log("[batch] direct-drop attempt " + juce::String(attempt) + " ok=" + juce::String(dropOk ? 1 : 0)
-                + " state=" + juce::String((int) s.getSize()) + (loaded ? "  <-- LOADED" : ""));
-            if (keepAlive) keepAlive->Release();
-            keepAlive = pdo;               // hold the latest data object alive across the pump
+            const auto baseSize = (int) st0.getSize();
+            IDataObject* keepAlive = nullptr;
+            const int directAttempts = mode == BatchMode::BakeState ? 1 : 5;
+            for (int attempt = 0; attempt < directAttempts && !loaded; ++attempt)
+            {
+                if (attempt > 0) pumpFor(700 * attempt);   // give Serum more UI-ready time each retry
+                const bool foreground = activateBakeWindow(top);
+                pumpFor(120);
+                log("[batch] bake window foreground=" + juce::String(foreground ? 1 : 0));
+                bool dropOk = false;
+                IDataObject* pdo = dropFileBestTarget(top, presetPath, dropOk);
+                pumpFor(1300);                 // Serum may read the file on a later tick
+                juce::MemoryBlock s;
+                inst->getStateInformation(s);
+                loaded = ((int) s.getSize() > baseSize + 500);
+                log("[batch] direct-drop attempt " + juce::String(attempt) + " ok=" + juce::String(dropOk ? 1 : 0)
+                    + " state=" + juce::String((int) s.getSize()) + (loaded ? "  <-- LOADED" : ""));
+                if (keepAlive) keepAlive->Release();
+                keepAlive = pdo;               // hold the latest data object alive across the pump
+            }
+            // Serum 2 may reject direct IDropTarget calls even while its peer is
+            // foreground because it also expects OLE's real modal drag state. The
+            // bake phase is the only interactive phase, so use the bounded real OLE
+            // loop as its final fallback. The watchdog in dropFileViaDragLoop always
+            // releases the mouse and terminates the loop; render-state never enters it.
+            if (!loaded && mode != BatchMode::RenderState)
+            {
+                activateBakeWindow(top);
+                const bool dragOk = dropFileViaDragLoop(center, presetPath);
+                pumpFor(1800);
+                juce::MemoryBlock s;
+                inst->getStateInformation(s);
+                loaded = ((int) s.getSize() > baseSize + 500);
+                log("[batch] real-drag fallback ok=" + juce::String(dragOk ? 1 : 0)
+                    + " state=" + juce::String((int) s.getSize())
+                    + (loaded ? "  <-- LOADED" : ""));
+            }
+            // Keep the data object alive until Serum has consumed any deferred load.
+            if (keepAlive) { pumpFor(300); keepAlive->Release(); }
         }
-        // No DoDragDrop fallback: it hangs forever when launched unattended (no
-        // ambient mouse), so it only ever wastes the timeout. If the direct drop
-        // failed all attempts we exit non-zero below and the caller relaunches a
-        // fresh process (which reliably loads) rather than burning 60s here.
-        if (keepAlive) { pumpFor(300); keepAlive->Release(); }
+        else { log("[batch] Serum reports no editor"); }
     }
-    else { log("[batch] Serum reports no editor"); }
 #endif
     if (!loaded) log("[batch] WARNING: preset NOT loaded after retries");
+
+    bool stateWritten = false;
+    if (loaded && mode == BatchMode::BakeState)
+    {
+        juce::MemoryBlock baked;
+        inst->getStateInformation(baked);
+        juce::File stateFile(statePath);
+        stateFile.getParentDirectory().createDirectory();
+        stateWritten = !baked.isEmpty()
+            && stateFile.replaceWithData(baked.getData(), baked.getSize());
+        log("[batch] baked state bytes=" + juce::String((int) baked.getSize())
+            + " written=" + juce::String(stateWritten ? 1 : 0));
+    }
 
     // Render the LIVE instance directly: it holds the just-loaded preset. The
     // offline te::Renderer would re-instantiate Serum and CANNOT restore its
     // (editor-dependent) encrypted state, so it renders the default sound.
-    // Suspend Tracktion's audio thread first so it isn't also calling processBlock.
+    // Headless opened only the default output; its audio thread would also call
+    // processBlock, so suspend the engine (which CLOSES that device) before we render
+    // manually. We deliberately do NOT resumeEngine() afterward — that re-opens the
+    // user's saved interface (restoreSavedAudioSettings) — and we hard-exit anyway.
     em.suspendEngine();
     juce::MessageManager::getInstance()->runDispatchLoopUntil(150);
 
-    // Multisample: load the preset once, render so each sample SOUNDS at the
-    // target octave C1..C5. The preset transposes by octaveOffset (sounding =
-    // midi + offset), so play midi = targetBase - 12*offset. Skip if the
-    // pre-compensated MIDI falls outside 0..127 (octave unreachable by keytrack).
-    struct Note { const char* name; int base; };
-    const Note notes[] = { {"C1", 24}, {"C2", 36}, {"C3", 48}, {"C4", 60}, {"C5", 72} };
-    int written = 0, target = 0;
-    for (const auto& nt : notes)
+    int written = stateWritten ? 1 : 0, target = mode == BatchMode::BakeState ? 1 : 0;
+    if (mode != BatchMode::BakeState && midiPath.isNotEmpty())
     {
-        const int midi = nt.base - 12 * octaveOffset;
-        if (midi < 0 || midi > 127)
+        // MIDI print: play the clip through the live preset AS WRITTEN (no octave
+        // pre-comp — this is what a producer hears dropping the preset on the clip
+        // in a DAW). loopBars>0 -> seamless bar-locked loop (no tail); else one-shot
+        // with a release tail so FX ring out.
+        double clipEndSec = 0.0;
+        log("[batch] entering midi branch -> loadMidiClip");
+        auto events = loadMidiClip(juce::File(midiPath), bpm, clipEndSec);
+        target = 1;
+        if (!events.empty())
         {
-            log("[batch] skip " + juce::String(nt.name) + " (MIDI " + juce::String(midi)
-                + " out of range, octave unreachable)");
-            continue;
+            juce::AudioBuffer<float> audio;
+            if (loopBars > 0)
+            {
+                const double loopLenSec = loopBars * 4.0 * 60.0 / bpm;   // 4/4 bars
+                log("[batch] LOOP bars=" + juce::String(loopBars)
+                    + " loopLenSec=" + juce::String(loopLenSec)
+                    + " events=" + juce::String((int) events.size())
+                    + " bpm=" + juce::String(bpm));
+                audio = renderMidiLoop(*inst, events, loopLenSec);
+            }
+            else
+            {
+                constexpr double kTailSec = 3.0;
+                log("[batch] ONESHOT endSec=" + juce::String(clipEndSec)
+                    + " tail=" + juce::String(kTailSec)
+                    + " events=" + juce::String((int) events.size()));
+                audio = renderMidiClip(*inst, events, clipEndSec, kTailSec);
+            }
+            juce::File wav = outFolder.getChildFile("clip.wav");
+            writeWav(wav, audio);
+            if (wav.existsAsFile()) ++written;
+            log("[batch] midi render rms=" + juce::String(rms(audio))
+                + " frames=" + juce::String(audio.getNumSamples())
+                + " durSec=" + juce::String(audio.getNumSamples() / kSampleRate));
         }
-        ++target;
-        auto audio = renderNote(*inst, midi);
-        juce::File wav = outFolder.getChildFile(juce::String(nt.name) + ".wav");
-        writeWav(wav, audio);
-        if (wav.existsAsFile()) ++written;
-        log("[batch] render " + juce::String(nt.name) + " (midi=" + juce::String(midi)
-            + ") rms=" + juce::String(rms(audio)));
     }
-    em.resumeEngine();
+    else if (mode != BatchMode::BakeState)
+    {
+        // Multisample: load the preset once, render so each sample SOUNDS at the
+        // target octave C1..C5. The preset transposes by octaveOffset (sounding =
+        // midi + offset), so play midi = targetBase - 12*offset. Skip if the
+        // pre-compensated MIDI falls outside 0..127 (octave unreachable by keytrack).
+        struct Note { const char* name; int base; };
+        const Note notes[] = { {"C1", 24}, {"C2", 36}, {"C3", 48}, {"C4", 60}, {"C5", 72} };
+        for (const auto& nt : notes)
+        {
+            const int midi = nt.base - 12 * octaveOffset;
+            if (midi < 0 || midi > 127)
+            {
+                log("[batch] skip " + juce::String(nt.name) + " (MIDI " + juce::String(midi)
+                    + " out of range, octave unreachable)");
+                continue;
+            }
+            ++target;
+            auto audio = renderNote(*inst, midi);
+            juce::File wav = outFolder.getChildFile(juce::String(nt.name) + ".wav");
+            writeWav(wav, audio);
+            if (wav.existsAsFile()) ++written;
+            log("[batch] render " + juce::String(nt.name) + " (midi=" + juce::String(midi)
+                + ") rms=" + juce::String(rms(audio)));
+        }
+    }
+    // No resumeEngine(): headless never opened a device, and resuming would re-open
+    // the user's audio interface. We hard-exit right below anyway.
     const bool ok = (written == target) && target > 0 && loaded;
     log("[batch] DONE written=" + juce::String(written) + "/" + juce::String(target)
         + " loaded=" + juce::String(loaded ? 1 : 0));

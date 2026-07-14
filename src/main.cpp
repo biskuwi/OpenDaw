@@ -93,7 +93,10 @@ int main(int argc, char* argv[])
     // window, then drive the drop+render from a timer in the proven event loop.
     bool batchRender = false;
     for (int i = 1; i < argc; ++i)
-        if (std::strcmp(argv[i], "--serum-render") == 0)
+        if (std::strcmp(argv[i], "--serum-render") == 0
+            || std::strcmp(argv[i], "--serum-render-midi") == 0
+            || std::strcmp(argv[i], "--serum-bake") == 0
+            || std::strcmp(argv[i], "--serum-render-state") == 0)
             batchRender = true;
 
     QApplication qtApp(argc, argv);
@@ -131,7 +134,7 @@ int main(int argc, char* argv[])
     qDebug() << "[main] creating app";
     OpenDaw::OpenDawApplication app;
     qDebug() << "[main] calling initialize";
-    if (!app.initialize())
+    if (!app.initialize(batchRender))   // headless render: skip audio-device init
         return 1;
 
     // Headless render: drive drop+render in the running Qt/JuceQtBridge loop, then quit.
